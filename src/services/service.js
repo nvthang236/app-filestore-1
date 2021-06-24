@@ -15,6 +15,7 @@ const uuid = require('uuid');
 const Devebot = require('devebot');
 const Promise = Devebot.require('bluebird');
 const lodash = Devebot.require('lodash');
+const pipeline = Promise.promisify(require('stream').pipeline);
 
 const stringUtil = require('../supports/string-util');
 
@@ -77,6 +78,11 @@ function Service(params = {}) {
       box.fileInfo = fileInfo;
       box.thumbnailFile = path.join(thumbnailDir, box.fileId, util.format('thumbnail-%sx%s', box.width, box.height));
 
+      if (fileInfo.s3) {
+        box.thumbnailFile = box.thumbnailFile.replace(thumbnailDir + '/', '');
+        return filestoreHandler.resizePicture(box).then(() => box.thumbnailFile);
+      }
+
       return Promise.promisify(function(done) {
         fs.stat(box.thumbnailFile, function(err, stats) {
           if (!err) return done(null, box.thumbnailFile);
@@ -107,11 +113,14 @@ function Service(params = {}) {
       let originalName = stringUtil.slugify(filename);
       res.setHeader('Content-disposition', 'attachment; filename=' + originalName);
       res.setHeader('Content-type', mimetype);
+      if (box.fileInfo.s3) {
+        return filestoreHandler.getFileS3({ path: thumbnailFile, writable: res });
+      }
       let filestream = fs.createReadStream(thumbnailFile);
       filestream.on('end', function() {
         L.has('silly') && L.log('silly', ' - the thumbnail has been full-loaded');
       });
-      filestream.pipe(res);
+      return pipeline(filestream, res);
     })
     .catch(function(err) {
       res.status(404).send('Error: ' + JSON.stringify(err));
@@ -147,11 +156,14 @@ function Service(params = {}) {
       let originalName = stringUtil.slugify(filename);
       res.setHeader('Content-disposition', 'attachment; filename=' + originalName);
       res.setHeader('Content-type', mimetype);
+      if (fileInfo.s3) {
+        return filestoreHandler.getFileS3({ path: fileInfo.path, writable: res });
+      }
       let filestream = fs.createReadStream(filepath);
       filestream.on('end', function() {
         L.has('silly') && L.log('silly', ' - the file has been full-loaded');
       });
-      filestream.pipe(res);
+      return pipeline(filestream, res);
     })
     .catch(function(err) {
       res.status(404).send('Error: ' + JSON.stringify(err));
@@ -208,6 +220,10 @@ function Service(params = {}) {
       if (lodash.isEmpty(ctx.fileId) || lodash.isEmpty(ctx.fileInfo)) {
         return Promise.reject('invalid_upload_fields');
       }
+      ctx.fileInfo.s3 = null;
+      if (result.fields.s3 === 'true') {
+        ctx.fileInfo.s3 = true;
+      }
       return filestoreHandler.saveFile(ctx);
     })
     .then(function(returnInfo) {
@@ -231,6 +247,52 @@ function Service(params = {}) {
         });
       }
     });
+  });
+
+  filestoreRouter.route('/uploadFromDisk').get(async function(req, res, next) {
+    try {
+      L.has('silly') &&
+        L.log('silly', ' - the /uploadFromDisk is requested ...');
+
+      const concurrency = process.env.CONCURRENCY || 100;
+
+      while (true) {
+        const fileInfos = await mongoManipulator.findDocuments(
+          pluginCfg.collections.FILE,
+          {
+            status: 'ok',
+            s3: { $ne: true },
+          },
+          0,
+          concurrency
+        );
+
+        if (lodash.isEmpty(fileInfos)) {
+          break;
+        }
+
+        await Promise.all(
+          fileInfos.map((fileInfo) =>
+            filestoreHandler.uploadFromDisk({
+              fileSource: fileInfo.path,
+              fileInfo,
+            })
+          )
+        );
+      }
+
+      L.has('silly') &&
+        L.log(
+          'silly',
+          T.toMessage({
+            text: 'The /uploadFromDisk has been done successfully',
+          })
+        );
+
+      res.sendStatus(200);
+    } catch (err) {
+      res.status(404).json({ error: JSON.stringify(err) });
+    }
   });
 
   this.getFilestoreLayer = function() {
